@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <lz4.h>
+#include <roaring64map.hh>
 
 size_t write_int(FILE* fp, int i) {
     return fwrite(&i, sizeof(i), 1, fp);
@@ -42,6 +43,9 @@ class LZ4Compressor {
     int pos_;
     LZ4_stream_t stream_;
     FILE* file_;
+    size_t file_size_;
+    size_t max_file_size_;
+    Roaring64Map bitmap_;
 
     void clear(int i) {
         memset(&frames_[i], 0, BLOCK_SIZE);
@@ -54,8 +58,8 @@ class LZ4Compressor {
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
-        write_int(file_, out_bytes);
-        write_bin(file_, write_buf_, static_cast<size_t>(out_bytes));
+        file_size_ += write_int(file_, out_bytes);
+        file_size_ += write_bin(file_, write_buf_, static_cast<size_t>(out_bytes));
     }
 public:
     LZ4Compressor(const char* file_name) {
@@ -65,13 +69,20 @@ public:
         clear(1);
         LZ4_resetStream(&stream_);
         file_ = fopen(file_name, "wb");
+        file_size_ = 0;
+        max_file_size_ = 1024*1024*256;  // 256MB
+    }
+
+    size_t file_size() const {
+        return file_size_;
     }
 
     ~LZ4Compressor() {
         fclose(file_);
     }
 
-    void append(uint64_t id, uint64_t timestamp, double value) {
+    bool append(uint64_t id, uint64_t timestamp, double value) {
+        bitmap_.add(id);
         union {
             double x;
             uint64_t d;
@@ -91,6 +102,7 @@ public:
             pos_ = (pos_ + 1) % 2;
             clear(pos_);
         }
+        return file_size_ < max_file_size_;
     }
 };
 

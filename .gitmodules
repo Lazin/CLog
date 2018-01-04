@@ -1,0 +1,4 @@
+[submodule "CLog/CRoaring"]
+	path = CLog/CRoaring
+	url = https://github.com/ksajme/CRoaring.git
+	branch = master
