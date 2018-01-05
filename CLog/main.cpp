@@ -11,17 +11,63 @@
 
 #include <lz4.h>
 #include <roaring64map.hh>
+#include <apr.h>
+#include <apr_file_io.h>
+#include <apr_general.h>
 
-static void fclose_(FILE* f) {
-    fclose(f);
+namespace {
+// Namespace for APR related stuff
+
+typedef std::unique_ptr<apr_pool_t, void (*)(apr_pool_t*)> AprPoolPtr;
+typedef std::unique_ptr<apr_file_t, void (*)(apr_file_t*)> AprFilePtr;
+
+void panic_on_error(apr_status_t status, const char* msg) {
+    if (status != APR_SUCCESS) {
+        char error_message[0x100];
+        apr_strerror(status, error_message, 0x100);
+        throw std::runtime_error(std::string(msg) + " " + error_message);
+    }
 }
 
-size_t write_int(FILE* fp, int i) {
-    return fwrite(&i, sizeof(i), 1, fp);
+void _close_apr_file(apr_file_t* file) {
+    apr_file_close(file);
 }
 
-size_t write_bin(FILE* fp, const void* array, size_t arrayBytes) {
-    return fwrite(array, 1, arrayBytes, fp);
+AprPoolPtr _make_apr_pool() {
+    apr_pool_t* mem_pool = NULL;
+    apr_status_t status = apr_pool_create(&mem_pool, NULL);
+    panic_on_error(status, "Can't create APR pool");
+    AprPoolPtr pool(mem_pool, &apr_pool_destroy);
+    return std::move(pool);
+}
+
+AprFilePtr _open_file(const char* file_name, apr_pool_t* pool) {
+    apr_file_t* pfile = nullptr;
+    apr_status_t status = apr_file_open(&pfile, file_name, APR_WRITE|APR_BINARY, APR_OS_DEFAULT, pool);
+    panic_on_error(status, "Can't open file");
+    AprFilePtr file(pfile, &_close_apr_file);
+    return std::move(file);
+}
+
+
+size_t _get_file_size(apr_file_t* file) {
+    apr_finfo_t info;
+    auto status = apr_file_info_get(&info, APR_FINFO_SIZE, file);
+    panic_on_error(status, "Can't get file info");
+    return static_cast<size_t>(info.size);
+}
+
+size_t _write_frame(AprFilePtr& file, uint32_t size, void* array) {
+    size_t outsize = 0;
+    iovec io[2] = {
+        {&size, sizeof(uint32_t)},
+        {array, size},
+    };
+    apr_status_t status = apr_file_writev_full(file.get(), io, 2, &outsize);
+    panic_on_error(status, "Can't write frame to file");
+    return outsize;
+}
+
 }
 
 
@@ -46,7 +92,8 @@ class LZ4Volume {
 
     int pos_;
     LZ4_stream_t stream_;
-    std::unique_ptr<FILE, int (*)(FILE*)> file_;
+    AprPoolPtr pool_;
+    AprFilePtr file_;
     size_t file_size_;
     const size_t max_file_size_;
     Roaring64Map bitmap_;
@@ -58,21 +105,26 @@ class LZ4Volume {
     void write(int i) {
         Frame& frame = frames_[i];
         // Do write
-        int out_bytes = LZ4_compress_fast_continue(&stream_, frame.block, write_buf_, BLOCK_SIZE, sizeof(write_buf_), 1);
+        int out_bytes = LZ4_compress_fast_continue(&stream_,
+                                                   frame.block,
+                                                   write_buf_,
+                                                   BLOCK_SIZE,
+                                                   sizeof(write_buf_),
+                                                   1);
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
-        // TODO: I/O errors should be handled
-        file_size_ += write_int(file_.get(), out_bytes);
-        file_size_ += write_bin(file_.get(), write_buf_, static_cast<size_t>(out_bytes));
+
+        file_size_ += _write_frame(file_, static_cast<uint32_t>(out_bytes), write_buf_);
     }
 public:
     LZ4Volume(const char* file_name)
         : path_(file_name)
         , pos_(0)
-        , file_((FILE*)fopen(file_name, "wb"), &fclose_)
+        , pool_(_make_apr_pool())
+        , file_(_open_file(file_name, pool_.get()))
         , file_size_(0)
-        , max_file_size_(1024*1024*256)  // 256MB
+        , max_file_size_(1024*1024*256)
     {
         clear(0);
         clear(1);
@@ -123,7 +175,7 @@ class InputLog {
     std::string get_volume_name() {
         // TODO: use boost filesystem
         std::stringstream fmt;
-        fmt << root_dir_ << "/" << inputlog << volume_counter_ << ".ils";
+        fmt << root_dir_ << "/" << "inputlog" << volume_counter_ << ".ils";
         return fmt.str();
     }
 
@@ -138,6 +190,7 @@ class InputLog {
         volumes_.pop_back();
         volume->delete_file();
     }
+
 public:
     InputLog(const char* rootdir, size_t nvol)
         : root_dir_(rootdir)
@@ -172,6 +225,7 @@ public:
 
 int main()
 {
+    apr_initialize();
     LZ4Volume compressor("/tmp/log.lz4");
     int nids = 1000;
     std::vector<uint64_t> ids;
