@@ -75,6 +75,16 @@ size_t _write_frame(AprFilePtr& file, uint32_t size, void* array) {
     return outsize;
 }
 
+size_t _read_frame(AprFilePtr& file, uint32_t array_size, void* array) {
+    uint32_t size;
+    size_t bytes_read = 0;
+    apr_status_t status = apr_file_read_full(file.get(), &size, sizeof(size), &bytes_read);
+    panic_on_error(status, "Can't read frame header");
+    status = apr_file_read_full(file.get(), array, std::min(array_size, size), &bytes_read);
+    panic_on_error(status, "Can't read frame body");
+    return bytes_read;
+}
+
 }
 
 
@@ -95,10 +105,11 @@ class LZ4Volume {
         } part;
     } frames_[2];
 
-    char write_buf_[LZ4_COMPRESSBOUND(BLOCK_SIZE)];
+    char buffer_[LZ4_COMPRESSBOUND(BLOCK_SIZE)];
 
     int pos_;
     LZ4_stream_t stream_;
+    LZ4_streamDecode_t decode_stream_;
     AprPoolPtr pool_;
     AprFilePtr file_;
     size_t file_size_;
@@ -116,14 +127,30 @@ class LZ4Volume {
         // Do write
         int out_bytes = LZ4_compress_fast_continue(&stream_,
                                                    frame.block,
-                                                   write_buf_,
+                                                   buffer_,
                                                    BLOCK_SIZE,
-                                                   sizeof(write_buf_),
+                                                   sizeof(buffer_),
                                                    1);
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
-        file_size_ += _write_frame(file_, static_cast<uint32_t>(out_bytes), write_buf_);
+        file_size_ += _write_frame(file_, static_cast<uint32_t>(out_bytes), buffer_);
+    }
+
+    void read(int i) {
+        assert(is_read_only_);
+        Frame& frame = frames_[i];
+        // Read frame
+        uint32_t frame_size = _read_frame(file_, sizeof(buffer_), buffer_);
+        assert(frame_size <= sizeof(buffer_));
+        int out_bytes = LZ4_decompress_safe_continue(&decode_stream_,
+                                                     buffer_,
+                                                     frame.block,
+                                                     frame_size,
+                                                     BLOCK_SIZE);
+        if(out_bytes <= 0) {
+            throw std::runtime_error("LZ4 error");
+        }
     }
 public:
     /**
@@ -160,7 +187,7 @@ public:
     {
         clear(0);
         clear(1);
-        LZ4_resetStream(&stream_);
+        LZ4_setStreamDecode(&decode_stream_, NULL, 0);
     }
 
     size_t file_size() const {
@@ -169,11 +196,6 @@ public:
 
     bool append(uint64_t id, uint64_t timestamp, double value) {
         bitmap_.add(id);
-        union {
-            double x;
-            uint64_t d;
-        } bits;
-        bits.x = value;
         Frame& frame = frames_[pos_];
         frame.part.ids[frame.part.size] = id;
         frame.part.timestamps[frame.part.size] = timestamp;
