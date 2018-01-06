@@ -43,12 +43,19 @@ AprPoolPtr _make_apr_pool() {
 
 AprFilePtr _open_file(const char* file_name, apr_pool_t* pool) {
     apr_file_t* pfile = nullptr;
-    apr_status_t status = apr_file_open(&pfile, file_name, APR_WRITE|APR_BINARY, APR_OS_DEFAULT, pool);
+    apr_status_t status = apr_file_open(&pfile, file_name, APR_WRITE|APR_BINARY|APR_CREATE, APR_OS_DEFAULT, pool);
     panic_on_error(status, "Can't open file");
     AprFilePtr file(pfile, &_close_apr_file);
     return std::move(file);
 }
 
+AprFilePtr _open_file_ro(const char* file_name, apr_pool_t* pool) {
+    apr_file_t* pfile = nullptr;
+    apr_status_t status = apr_file_open(&pfile, file_name, APR_READ|APR_BINARY, APR_OS_DEFAULT, pool);
+    panic_on_error(status, "Can't open file");
+    AprFilePtr file(pfile, &_close_apr_file);
+    return std::move(file);
+}
 
 size_t _get_file_size(apr_file_t* file) {
     apr_finfo_t info;
@@ -97,12 +104,14 @@ class LZ4Volume {
     size_t file_size_;
     const size_t max_file_size_;
     Roaring64Map bitmap_;
+    const bool is_read_only_;
 
     void clear(int i) {
         memset(&frames_[i], 0, BLOCK_SIZE);
     }
 
     void write(int i) {
+        assert(!is_read_only_);
         Frame& frame = frames_[i];
         // Do write
         int out_bytes = LZ4_compress_fast_continue(&stream_,
@@ -114,17 +123,40 @@ class LZ4Volume {
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
-
         file_size_ += _write_frame(file_, static_cast<uint32_t>(out_bytes), write_buf_);
     }
 public:
-    LZ4Volume(const char* file_name)
+    /**
+     * @brief Create empty volume
+     * @param file_name is string that contains volume file name
+     * @param volume_size is a maximum allowed volume size
+     */
+    LZ4Volume(const char* file_name, size_t volume_size)
         : path_(file_name)
         , pos_(0)
         , pool_(_make_apr_pool())
         , file_(_open_file(file_name, pool_.get()))
         , file_size_(0)
-        , max_file_size_(1024*1024*256)
+        , max_file_size_(volume_size)
+        , is_read_only_(false)
+    {
+        clear(0);
+        clear(1);
+        LZ4_resetStream(&stream_);
+    }
+
+    /**
+     * @brief Read existing volume
+     * @param file_name volume file name
+     */
+    LZ4Volume(const char* file_name)
+        : path_(file_name)
+        , pos_(0)
+        , pool_(_make_apr_pool())
+        , file_(_open_file_ro(file_name, pool_.get()))
+        , file_size_(_get_file_size(file_.get()))
+        , max_file_size_(0)
+        , is_read_only_(true)
     {
         clear(0);
         clear(1);
@@ -152,7 +184,7 @@ public:
             pos_ = (pos_ + 1) % 2;
             clear(pos_);
         }
-        return file_size_ < max_file_size_;
+        return file_size_ >= max_file_size_;
     }
 
     const std::string get_path() const {
@@ -162,15 +194,20 @@ public:
     void delete_file() {
         file_.reset();
         remove(path_.c_str());
-        // TODO: log volume->get_path() deleted
+    }
+
+    const Roaring64Map& get_index() const {
+        return bitmap_;
     }
 };
+
 
 class InputLog {
     std::deque<std::unique_ptr<LZ4Volume>> volumes_;
     std::string root_dir_;
     size_t volume_counter_;
     const size_t max_volumes_;
+    const size_t volume_size_;
 
     std::string get_volume_name() {
         // TODO: use boost filesystem
@@ -180,7 +217,7 @@ class InputLog {
     }
 
     void add_volume(std::string path) {
-        std::unique_ptr<LZ4Volume> volume(new LZ4Volume(path.c_str()));
+        std::unique_ptr<LZ4Volume> volume(new LZ4Volume(path.c_str(), volume_size_));
         volumes_.push_front(std::move(volume));
         volume_counter_++;
     }
@@ -192,10 +229,11 @@ class InputLog {
     }
 
 public:
-    InputLog(const char* rootdir, size_t nvol)
+    InputLog(const char* rootdir, size_t nvol, size_t svol)
         : root_dir_(rootdir)
         , volume_counter_(0)
         , max_volumes_(nvol)
+        , volume_size_(svol)
     {
         std::string path = get_volume_name();
         add_volume(path);
@@ -214,10 +252,28 @@ public:
       * input log on next rotation. Rotation should be triggered manually.
       */
     bool append(uint64_t id, uint64_t timestamp, double value, std::vector<uint64_t>* stale_ids) {
+        bool result = volumes_.front()->append(id, timestamp, value);
+        if (result && volumes_.size() == max_volumes_) {
+            // Extract stale ids
+            assert(volumes_.size() > 0);
+            std::vector<const Roaring64Map*> remaining;
+            for (size_t i = 0; i < volumes_.size() - 1; i++) {
+                // move from newer to older volumes
+                remaining.push_back(&volumes_.at(i)->get_index());
+            }
+            Roaring64Map sum = Roaring64Map::fastunion(remaining.size(), remaining.data());
+            auto stale = volumes_.back()->get_index() - sum;
+            for (auto it = stale.begin(); it != stale.end(); it++) {
+                stale_ids->push_back(*it);
+            }
+        }
+        return result;
     }
 
     void rotate() {
-        remove_last_volume();
+        if (volumes_.size() >= max_volumes_) {
+            remove_last_volume();
+        }
         std::string path = get_volume_name();
         add_volume(path);
     }
@@ -226,7 +282,7 @@ public:
 int main()
 {
     apr_initialize();
-    LZ4Volume compressor("/tmp/log.lz4");
+    InputLog logger("/tmp", 5, 10*1024*1024);
     int nids = 1000;
     std::vector<uint64_t> ids;
     for (int i = 0; i < nids; i++) {
@@ -238,14 +294,31 @@ int main()
         basis.push_back(static_cast<double>(rand() % 100000) / 1000.0);
         delta.push_back(static_cast<double>(rand() % 100) / 1000.0);
     }
-    int64_t nvalues = 10000;
-    int64_t total   = 0;
-    for (int64_t i = 0; i < nvalues; i++) {
+    int64_t nitems = 10000;
+    int64_t total  = 1;
+    int64_t basets = 10000000;
+    // push single item
+    std::vector<uint64_t> outids;
+    bool res = logger.append(42, basets, 0.1234, &outids);
+    assert(!res);
+    int rotation = 0;
+    for (int64_t i = 0; i < nitems; i++) {
         for (int j = 0; j < nids; j++) {
             uint64_t id  = ids[j];
             double value = basis[j];
             basis[j] += delta[j];
-            compressor.append(id, i + 10000000, value);
+            if (logger.append(id, i + basets, value, &outids)) {
+                if (outids.size() != 1) {
+                    std::cout << outids.size() << " elements is out" << std::endl;
+                } else {
+                    std::cout << outids.at(0) << " is out" << std::endl;
+                }
+                outids.clear();
+                std::cout << "rotation " << rotation << std::endl;
+                rotation++;
+                logger.rotate();
+                std::cout << std::endl;
+            }
             total++;
         }
     }
