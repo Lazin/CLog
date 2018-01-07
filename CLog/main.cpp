@@ -15,6 +15,8 @@
 #include <apr_file_io.h>
 #include <apr_general.h>
 
+#include <boost/filesystem.hpp>
+
 namespace {
 // Namespace for APR related stuff
 
@@ -265,20 +267,52 @@ public:
 
 
 class InputLog {
+    typedef boost::filesystem::path Path;
     std::deque<std::unique_ptr<LZ4Volume>> volumes_;
-    std::string root_dir_;
+    Path root_dir_;
     size_t volume_counter_;
     const size_t max_volumes_;
     const size_t volume_size_;
+    std::vector<Path> available_volumes_;
+
+    void find_volumes() {
+        if (!boost::filesystem::exists(root_dir_)) {
+            throw std::runtime_error(root_dir_.string() + " doesn't exist");
+        }
+        if (!boost::filesystem::is_directory(root_dir_)) {
+            throw std::runtime_error(root_dir_.string() + " is not a directory");
+        }
+        for (auto it = boost::filesystem::directory_iterator(root_dir_);
+             it != boost::filesystem::directory_iterator(); it++) {
+            Path path = *it;
+            available_volumes_.push_back(path);
+        }
+        auto extract = [](Path path) {
+            std::string str = path.filename().string();
+            // remove 'inputlog' from the begining and '.ils' from the end
+            std::string num = str.substr(8, str.size() - 4);
+            return std::atol(num.c_str());
+        };
+        auto sort_fn = [extract](Path lhs, Path rhs) {
+            auto lnum = extract(lhs);
+            auto rnum = extract(rhs);
+            return lnum < rnum;
+        };
+        std::sort(available_volumes_.begin(), available_volumes_.end(), sort_fn);
+    }
 
     std::string get_volume_name() {
-        // TODO: use boost filesystem
-        std::stringstream fmt;
-        fmt << root_dir_ << "/" << "inputlog" << volume_counter_ << ".ils";
-        return fmt.str();
+        std::stringstream filename;
+        filename << "inputlog" << volume_counter_ << ".ils";
+        Path path = root_dir_ / filename.str();
+        return path.string();
     }
 
     void add_volume(std::string path) {
+        if (boost::filesystem::exists(path)) {
+            std::cerr << "Path " << path << " already exists" << std::endl;
+            throw std::runtime_error("File already exists");
+        }
         std::unique_ptr<LZ4Volume> volume(new LZ4Volume(path.c_str(), volume_size_));
         volumes_.push_front(std::move(volume));
         volume_counter_++;
@@ -288,9 +322,17 @@ class InputLog {
         auto volume = std::move(volumes_.back());
         volumes_.pop_back();
         volume->delete_file();
+        // TODO: use logging library
+        std::cout << "Remove volume " << volume->get_path() << std::endl;
     }
 
 public:
+    /**
+     * @brief Create writeable input log
+     * @param rootdir is a directory containing all volumes
+     * @param nvol max number of volumes
+     * @param svol individual volume size
+     */
     InputLog(const char* rootdir, size_t nvol, size_t svol)
         : root_dir_(rootdir)
         , volume_counter_(0)
@@ -301,10 +343,24 @@ public:
         add_volume(path);
     }
 
+    /**
+     * @brief Recover information from input log
+     * @param rootdir is a directory containing all volumes
+     */
+    InputLog(const char* rootdir)
+        : root_dir_(rootdir)
+        , volume_counter_(0)
+        , max_volumes_(0)
+        , volume_size_(0)
+    {
+    }
+
     /** Delete all files.
       */
     void delete_files() {
+        std::cout << "Delete all files" << std::endl;
         for (auto& it: volumes_) {
+            std::cout << "Delete " << it->get_path() << std::endl;
             it->delete_file();
         }
     }
