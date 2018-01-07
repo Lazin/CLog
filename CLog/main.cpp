@@ -116,6 +116,8 @@ class LZ4Volume {
     const size_t max_file_size_;
     Roaring64Map bitmap_;
     const bool is_read_only_;
+    int64_t bytes_to_read_;
+    int elements_to_read_;  // in current frame
 
     void clear(int i) {
         memset(&frames_[i], 0, BLOCK_SIZE);
@@ -137,7 +139,7 @@ class LZ4Volume {
         file_size_ += _write_frame(file_, static_cast<uint32_t>(out_bytes), buffer_);
     }
 
-    void read(int i) {
+    int read(int i) {
         assert(is_read_only_);
         Frame& frame = frames_[i];
         // Read frame
@@ -151,6 +153,7 @@ class LZ4Volume {
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
+        return out_bytes + sizeof(uint32_t);
     }
 public:
     /**
@@ -166,6 +169,8 @@ public:
         , file_size_(0)
         , max_file_size_(volume_size)
         , is_read_only_(false)
+        , bytes_to_read_(0)
+        , elements_to_read_(0)
     {
         clear(0);
         clear(1);
@@ -178,12 +183,14 @@ public:
      */
     LZ4Volume(const char* file_name)
         : path_(file_name)
-        , pos_(0)
+        , pos_(1)
         , pool_(_make_apr_pool())
         , file_(_open_file_ro(file_name, pool_.get()))
         , file_size_(_get_file_size(file_.get()))
         , max_file_size_(0)
         , is_read_only_(true)
+        , bytes_to_read_(file_size_)
+        , elements_to_read_(0)
     {
         clear(0);
         clear(1);
@@ -207,6 +214,39 @@ public:
             clear(pos_);
         }
         return file_size_ >= max_file_size_;
+    }
+
+    /**
+     * @brief Read values in bulk (volume should be opened in read mode)
+     * @param buffer_size is a size of any input buffer (all should be of the same size)
+     * @param id is a pointer to buffer that should receive up to `buffer_size` ids
+     * @param ts is a pointer to buffer that should receive `buffer_size` timestamps
+     * @param xs is a pointer to buffer that should receive `buffer_size` values
+     * @return number of elements being read or 0 if EOF reached or negative value on error
+     */
+    int read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
+        if (elements_to_read_ == 0) {
+            if (bytes_to_read_ == 0) {
+                // Volume is finished
+                return -1;
+            }
+            pos_ = (pos_ + 1) % 2;
+            clear(pos_);
+            int bytes_read    = read(pos_);
+            bytes_to_read_   -= bytes_read;
+            elements_to_read_ = frames_[pos_].part.size;
+        }
+        Frame& frame = frames_[pos_];
+        size_t nvalues = std::min(buffer_size, static_cast<size_t>(elements_to_read_));
+        size_t frmsize = frame.part.size;
+        for (size_t i = 0; i < nvalues; i++) {
+            size_t ix = frmsize - elements_to_read_;
+            id[i] = frame.part.ids[ix];
+            ts[i] = frame.part.timestamps[ix];
+            xs[i] = frame.part.values[ix];
+            elements_to_read_--;
+        }
+        return static_cast<int>(nvalues);
     }
 
     const std::string get_path() const {
