@@ -258,6 +258,7 @@ public:
         if(file_size_ >= max_file_size_) {
             return AKU_EOVERFLOW;
         }
+        return AKU_SUCCESS;
     }
 
     /**
