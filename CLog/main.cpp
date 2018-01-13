@@ -16,6 +16,7 @@
 #include <apr_general.h>
 
 #include <boost/filesystem.hpp>
+#include <boost/algorithm/string.hpp>
 
 namespace {
 // Namespace for APR related stuff
@@ -90,7 +91,7 @@ size_t _read_frame(AprFilePtr& file, uint32_t array_size, void* array) {
 }
 
 
-class LZ4Volume {
+struct LZ4Volume {
     std::string path_;
     enum {
         BLOCK_SIZE = 0x2000,
@@ -155,7 +156,7 @@ class LZ4Volume {
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
-        return out_bytes + sizeof(uint32_t);
+        return frame_size + sizeof(uint32_t);
     }
 public:
     /**
@@ -228,9 +229,9 @@ public:
      */
     int read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
         if (elements_to_read_ == 0) {
-            if (bytes_to_read_ == 0) {
+            if (bytes_to_read_ <= 0) {
                 // Volume is finished
-                return -1;
+                return 0;
             }
             pos_ = (pos_ + 1) % 2;
             clear(pos_);
@@ -285,6 +286,12 @@ class InputLog {
         for (auto it = boost::filesystem::directory_iterator(root_dir_);
              it != boost::filesystem::directory_iterator(); it++) {
             Path path = *it;
+            if (!boost::starts_with(path.filename().string(), "inputlog")) {
+                continue;
+            }
+            if (path.extension().string() != ".ils") {
+                continue;
+            }
             available_volumes_.push_back(path);
         }
         auto extract = [](Path path) {
@@ -299,6 +306,19 @@ class InputLog {
             return lnum < rnum;
         };
         std::sort(available_volumes_.begin(), available_volumes_.end(), sort_fn);
+    }
+
+    void open_volumes() {
+        for (const auto& path: available_volumes_) {
+            std::unique_ptr<LZ4Volume> volume(new LZ4Volume(path.c_str()));
+            volumes_.push_back(std::move(volume));
+            volume_counter_++;
+        }
+        // TODO: remove
+        std::cout << "Volumes order:" << std::endl;
+        for (const auto& vol: volumes_) {
+            std::cout << vol->get_path() << std::endl;
+        }
     }
 
     std::string get_volume_name() {
@@ -353,6 +373,14 @@ public:
         , max_volumes_(0)
         , volume_size_(0)
     {
+        find_volumes();
+        open_volumes();
+    }
+
+    void reopen() {
+        assert(volume_size_ == 0 &&  max_volumes_ == 0);  // read mode
+        volumes_.clear();
+        open_volumes();
     }
 
     /** Delete all files.
@@ -388,6 +416,27 @@ public:
         return result;
     }
 
+    /**
+     * @brief Read values in bulk (volume should be opened in read mode)
+     * @param buffer_size is a size of any input buffer (all should be of the same size)
+     * @param id is a pointer to buffer that should receive up to `buffer_size` ids
+     * @param ts is a pointer to buffer that should receive `buffer_size` timestamps
+     * @param xs is a pointer to buffer that should receive `buffer_size` values
+     * @return number of elements being read or 0 if EOF reached or negative value on error
+     */
+    int read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
+        while(true) {
+            if (volumes_.empty()) {
+                return 0;
+            }
+            int result = volumes_.front()->read_next(buffer_size, id, ts, xs);
+            if (result != 0) {
+                return result;
+            }
+            volumes_.pop_front();
+        }
+    }
+
     void rotate() {
         if (volumes_.size() >= max_volumes_) {
             remove_last_volume();
@@ -400,46 +449,99 @@ public:
 int main()
 {
     apr_initialize();
-    InputLog logger("/tmp", 5, 10*1024*1024);
-    int nids = 1000;
-    std::vector<uint64_t> ids;
-    for (int i = 0; i < nids; i++) {
-        ids.push_back(i + 1000);
-    }
-    std::vector<double> basis;
-    std::vector<double> delta;
-    for (int i = 0; i < nids; i++) {
-        basis.push_back(static_cast<double>(rand() % 100000) / 1000.0);
-        delta.push_back(static_cast<double>(rand() % 100) / 1000.0);
-    }
-    int64_t nitems = 10000;
-    int64_t total  = 1;
-    int64_t basets = 10000000;
-    // push single item
-    std::vector<uint64_t> outids;
-    bool res = logger.append(42, basets, 0.1234, &outids);
-    assert(!res);
-    int rotation = 0;
-    for (int64_t i = 0; i < nitems; i++) {
-        for (int j = 0; j < nids; j++) {
-            uint64_t id  = ids[j];
-            double value = basis[j];
-            basis[j] += delta[j];
-            if (logger.append(id, i + basets, value, &outids)) {
-                if (outids.size() != 1) {
-                    std::cout << outids.size() << " elements is out" << std::endl;
-                } else {
-                    std::cout << outids.at(0) << " is out" << std::endl;
-                }
-                outids.clear();
-                std::cout << "rotation " << rotation << std::endl;
-                rotation++;
-                logger.rotate();
-                std::cout << std::endl;
-            }
-            total++;
+    std::deque<std::tuple<uint64_t, uint64_t, double>> model;
+    {
+
+        InputLog logger("/tmp", 50, 10*1024*1024);
+        int nids = 1000;
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < nids; i++) {
+            ids.push_back(i + 1000);
         }
+        std::vector<double> basis;
+        std::vector<double> delta;
+        for (int i = 0; i < nids; i++) {
+            basis.push_back(static_cast<double>(rand() % 100000) / 1000.0);
+            delta.push_back(static_cast<double>(rand() % 100) / 1000.0);
+        }
+        int64_t nitems = 10000;
+        int64_t total  = 1;
+        int64_t basets = 10000000;
+        // push single item
+        std::vector<uint64_t> outids;
+        model.push_back(std::make_tuple(42, basets, 0.1234));
+        bool res = logger.append(42, basets, 0.1234, &outids);
+        assert(!res);
+        int rotation = 0;
+        for (int64_t i = 0; i < nitems; i++) {
+            for (int j = 0; j < nids; j++) {
+                uint64_t id  = ids[j];
+                double value = basis[j];
+                uint64_t ts  = i + basets;
+                basis[j] += delta[j];
+                model.push_back(std::make_tuple(id, ts, value));
+                if (logger.append(id, ts, value, &outids)) {
+                    if (outids.size() != 1) {
+                        std::cout << outids.size() << " elements is out" << std::endl;
+                    } else {
+                        std::cout << outids.at(0) << " is out" << std::endl;
+                    }
+                    outids.clear();
+                    std::cout << "rotation " << rotation << std::endl;
+                    rotation++;
+                    logger.rotate();
+                    std::cout << std::endl;
+                }
+                total++;
+            }
+        }
+        std::cout << total << " values had been written" << std::endl;
     }
-    std::cout << total << " values had been written" << std::endl;
+
+    {
+        InputLog logreader("/tmp");
+        const size_t buffer_size=LZ4Volume::NUM_TUPLES;
+        uint64_t idsbuf[buffer_size];
+        uint64_t tssbuf[buffer_size];
+        double   xssbuf[buffer_size];
+
+        int res = 1;
+        uint64_t cnt = 0;
+        while(res > 0) {
+            res = logreader.read_next(buffer_size, idsbuf, tssbuf, xssbuf);
+            if (res < 0) {
+                std::cerr << "Error " << res << std::endl;
+                break;
+            }
+            for(int i = 0; i < res; i++) {
+                auto id = idsbuf[i];
+                auto ts = tssbuf[i];
+                auto xs = xssbuf[i];
+                uint64_t expid, expts;
+                double expxs;
+                std::tie(expid, expts, expxs) = model.front();
+                if (expid != id) {
+                    std::cerr << "Bad id at " << cnt << std::endl;
+                    std::cerr << "Expected " << expid << ", actual " << id << std::endl;
+                    std::terminate();
+                }
+                if (expts != ts) {
+                    std::cerr << "Bad timestamp at " << cnt << std::endl;
+                    std::cerr << "Expected " << expts << ", actual " << ts << std::endl;
+                    std::terminate();
+                }
+                if (expxs != xs) {
+                    std::cerr << "Bad value at " << cnt << std::endl;
+                    std::cerr << "Expected " << expxs << ", actual " << xs << std::endl;
+                    std::terminate();
+                }
+                cnt++;
+                model.pop_front();
+            }
+        }
+
+        logreader.reopen();
+        logreader.delete_files();
+    }
     return 0;
 }
