@@ -21,10 +21,24 @@
 namespace {
 // Namespace for APR related stuff
 
+enum aku_Status {
+    AKU_SUCCESS = 0,
+    AKU_EIO = 111,
+    AKU_EOVERFLOW = 222,
+};
+
 typedef std::unique_ptr<apr_pool_t, void (*)(apr_pool_t*)> AprPoolPtr;
 typedef std::unique_ptr<apr_file_t, void (*)(apr_file_t*)> AprFilePtr;
 
 void panic_on_error(apr_status_t status, const char* msg) {
+    if (status != APR_SUCCESS) {
+        char error_message[0x100];
+        apr_strerror(status, error_message, 0x100);
+        throw std::runtime_error(std::string(msg) + " " + error_message);
+    }
+}
+
+void log_apr_error(apr_status_t status, const char* msg) {
     if (status != APR_SUCCESS) {
         char error_message[0x100];
         apr_strerror(status, error_message, 0x100);
@@ -67,25 +81,34 @@ size_t _get_file_size(apr_file_t* file) {
     return static_cast<size_t>(info.size);
 }
 
-size_t _write_frame(AprFilePtr& file, uint32_t size, void* array) {
+std::tuple<aku_Status, size_t> _write_frame(AprFilePtr& file, uint32_t size, void* array) {
     size_t outsize = 0;
     iovec io[2] = {
         {&size, sizeof(uint32_t)},
         {array, size},
     };
     apr_status_t status = apr_file_writev_full(file.get(), io, 2, &outsize);
-    panic_on_error(status, "Can't write frame to file");
-    return outsize;
+    if (status != APR_SUCCESS) {
+        log_apr_error(status, "Can't write frame");
+        return std::make_tuple(AKU_EIO, 0u);
+    }
+    return std::make_tuple(AKU_SUCCESS, outsize);
 }
 
-size_t _read_frame(AprFilePtr& file, uint32_t array_size, void* array) {
+std::tuple<aku_Status, size_t> _read_frame(AprFilePtr& file, uint32_t array_size, void* array) {
     uint32_t size;
     size_t bytes_read = 0;
     apr_status_t status = apr_file_read_full(file.get(), &size, sizeof(size), &bytes_read);
-    panic_on_error(status, "Can't read frame header");
+    if (status != APR_SUCCESS) {
+        log_apr_error(status, "Can't read frame header");
+        return std::make_tuple(AKU_EIO, 0u);
+    }
     status = apr_file_read_full(file.get(), array, std::min(array_size, size), &bytes_read);
-    panic_on_error(status, "Can't read frame body");
-    return bytes_read;
+    if (status != APR_SUCCESS) {
+        log_apr_error(status, "Can't read frame body");
+        return std::make_tuple(AKU_EIO, 0u);
+    }
+    return std::make_tuple(AKU_SUCCESS, bytes_read);
 }
 
 }
@@ -126,7 +149,7 @@ struct LZ4Volume {
         memset(&frames_[i], 0, BLOCK_SIZE);
     }
 
-    void write(int i) {
+    aku_Status write(int i) {
         assert(!is_read_only_);
         Frame& frame = frames_[i];
         // Do write
@@ -139,14 +162,27 @@ struct LZ4Volume {
         if(out_bytes <= 0) {
             throw std::runtime_error("LZ4 error");
         }
-        file_size_ += _write_frame(file_, static_cast<uint32_t>(out_bytes), buffer_);
+        size_t size;
+        aku_Status status;
+        std::tie(status, size) = _write_frame(file_,
+                                              static_cast<uint32_t>(out_bytes),
+                                              buffer_);
+        if (status == AKU_SUCCESS) {
+            file_size_ += size;
+        }
+        return status;
     }
 
-    int read(int i) {
+    std::tuple<aku_Status, size_t> read(int i) {
         assert(is_read_only_);
         Frame& frame = frames_[i];
         // Read frame
-        uint32_t frame_size = _read_frame(file_, sizeof(buffer_), buffer_);
+        uint32_t frame_size;
+        aku_Status status;
+        std::tie(status, frame_size) = _read_frame(file_, sizeof(buffer_), buffer_);
+        if (status != AKU_SUCCESS) {
+            return std::make_tuple(status, 0);
+        }
         assert(frame_size <= sizeof(buffer_));
         int out_bytes = LZ4_decompress_safe_continue(&decode_stream_,
                                                      buffer_,
@@ -154,9 +190,9 @@ struct LZ4Volume {
                                                      frame_size,
                                                      BLOCK_SIZE);
         if(out_bytes <= 0) {
-            throw std::runtime_error("LZ4 error");
+            return std::make_tuple(AKU_EIO, 0);  // TODO: use different code
         }
-        return frame_size + sizeof(uint32_t);
+        return std::make_tuple(AKU_SUCCESS, frame_size + sizeof(uint32_t));
     }
 public:
     /**
@@ -204,7 +240,7 @@ public:
         return file_size_;
     }
 
-    bool append(uint64_t id, uint64_t timestamp, double value) {
+    aku_Status append(uint64_t id, uint64_t timestamp, double value) {
         bitmap_.add(id);
         Frame& frame = frames_[pos_];
         frame.part.ids[frame.part.size] = id;
@@ -212,11 +248,16 @@ public:
         frame.part.values[frame.part.size] = value;
         frame.part.size++;
         if (frame.part.size == NUM_TUPLES) {
-            write(pos_);
+            auto status = write(pos_);
+            if (status != AKU_SUCCESS) {
+                return status;
+            }
             pos_ = (pos_ + 1) % 2;
             clear(pos_);
         }
-        return file_size_ >= max_file_size_;
+        if(file_size_ >= max_file_size_) {
+            return AKU_EOVERFLOW;
+        }
     }
 
     /**
@@ -227,15 +268,20 @@ public:
      * @param xs is a pointer to buffer that should receive `buffer_size` values
      * @return number of elements being read or 0 if EOF reached or negative value on error
      */
-    int read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
+    std::tuple<aku_Status, uint32_t> read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
         if (elements_to_read_ == 0) {
             if (bytes_to_read_ <= 0) {
                 // Volume is finished
-                return 0;
+                return std::make_tuple(AKU_SUCCESS, 0);
             }
             pos_ = (pos_ + 1) % 2;
             clear(pos_);
-            int bytes_read    = read(pos_);
+            size_t bytes_read;
+            aku_Status status;
+            std::tie(status, bytes_read) = read(pos_);
+            if (status != AKU_SUCCESS) {
+                return std::make_tuple(status, 0);
+            }
             bytes_to_read_   -= bytes_read;
             elements_to_read_ = frames_[pos_].part.size;
         }
@@ -249,7 +295,7 @@ public:
             xs[i] = frame.part.values[ix];
             elements_to_read_--;
         }
-        return static_cast<int>(nvalues);
+        return std::make_tuple(AKU_SUCCESS, static_cast<int>(nvalues));
     }
 
     const std::string get_path() const {
@@ -397,9 +443,9 @@ public:
       * Return true on oveflow. Parameter `stale_ids` will be filled with ids that will leave the
       * input log on next rotation. Rotation should be triggered manually.
       */
-    bool append(uint64_t id, uint64_t timestamp, double value, std::vector<uint64_t>* stale_ids) {
-        bool result = volumes_.front()->append(id, timestamp, value);
-        if (result && volumes_.size() == max_volumes_) {
+    aku_Status append(uint64_t id, uint64_t timestamp, double value, std::vector<uint64_t>* stale_ids) {
+        aku_Status result = volumes_.front()->append(id, timestamp, value);
+        if (result == AKU_EOVERFLOW && volumes_.size() == max_volumes_) {
             // Extract stale ids
             assert(volumes_.size() > 0);
             std::vector<const Roaring64Map*> remaining;
@@ -424,14 +470,16 @@ public:
      * @param xs is a pointer to buffer that should receive `buffer_size` values
      * @return number of elements being read or 0 if EOF reached or negative value on error
      */
-    int read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
+    std::tuple<aku_Status, uint32_t> read_next(size_t buffer_size, uint64_t* id, uint64_t* ts, double* xs) {
         while(true) {
             if (volumes_.empty()) {
-                return 0;
+                return std::make_tuple(AKU_SUCCESS, 0);
             }
-            int result = volumes_.front()->read_next(buffer_size, id, ts, xs);
-            if (result != 0) {
-                return result;
+            aku_Status status;
+            uint32_t result;
+            std::tie(status, result) = volumes_.front()->read_next(buffer_size, id, ts, xs);
+            if (result != AKU_SUCCESS) {
+                return std::make_tuple(status, result);
             }
             volumes_.pop_front();
         }
@@ -470,8 +518,8 @@ int main()
         // push single item
         std::vector<uint64_t> outids;
         model.push_back(std::make_tuple(42, basets, 0.1234));
-        bool res = logger.append(42, basets, 0.1234, &outids);
-        assert(!res);
+        aku_Status res = logger.append(42, basets, 0.1234, &outids);
+        assert(res == AKU_SUCCESS);
         int rotation = 0;
         for (int64_t i = 0; i < nitems; i++) {
             for (int j = 0; j < nids; j++) {
@@ -480,7 +528,8 @@ int main()
                 uint64_t ts  = i + basets;
                 basis[j] += delta[j];
                 model.push_back(std::make_tuple(id, ts, value));
-                if (logger.append(id, ts, value, &outids)) {
+                res = logger.append(id, ts, value, &outids);
+                if (res == AKU_EOVERFLOW) {
                     if (outids.size() != 1) {
                         std::cout << outids.size() << " elements is out" << std::endl;
                     } else {
@@ -491,6 +540,9 @@ int main()
                     rotation++;
                     logger.rotate();
                     std::cout << std::endl;
+                } else if (res != AKU_SUCCESS) {
+                    std::cerr << "Failure " << res << std::endl;
+                    std::terminate();
                 }
                 total++;
             }
@@ -505,11 +557,12 @@ int main()
         uint64_t tssbuf[buffer_size];
         double   xssbuf[buffer_size];
 
-        int res = 1;
+        uint32_t res = 1;
+        aku_Status status;
         uint64_t cnt = 0;
-        while(res > 0) {
-            res = logreader.read_next(buffer_size, idsbuf, tssbuf, xssbuf);
-            if (res < 0) {
+        while(res != 0) {
+            std::tie(status, res) = logreader.read_next(buffer_size, idsbuf, tssbuf, xssbuf);
+            if (status != AKU_SUCCESS) {
                 std::cerr << "Error " << res << std::endl;
                 break;
             }
