@@ -10,7 +10,7 @@
 #include <sstream>
 
 #include <lz4.h>
-#include <roaring64map.hh>
+#include <roaring.hh>
 #include <apr.h>
 #include <apr_file_io.h>
 #include <apr_general.h>
