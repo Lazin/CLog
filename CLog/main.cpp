@@ -9,8 +9,8 @@
 #include <deque>
 #include <sstream>
 
-#include <lz4.h>
-#include <roaring64map.hh>
+#include <huf.h>
+#include <roaring.hh>
 #include <apr.h>
 #include <apr_file_io.h>
 #include <apr_general.h>
@@ -131,11 +131,9 @@ struct LZ4Volume {
         } part;
     } frames_[2];
 
-    char buffer_[LZ4_COMPRESSBOUND(BLOCK_SIZE)];
+    char buffer_[BLOCK_SIZE * 2];
 
     int pos_;
-    LZ4_stream_t stream_;
-    LZ4_streamDecode_t decode_stream_;
     AprPoolPtr pool_;
     AprFilePtr file_;
     size_t file_size_;
@@ -153,15 +151,7 @@ struct LZ4Volume {
         assert(!is_read_only_);
         Frame& frame = frames_[i];
         // Do write
-        int out_bytes = LZ4_compress_fast_continue(&stream_,
-                                                   frame.block,
-                                                   buffer_,
-                                                   BLOCK_SIZE,
-                                                   sizeof(buffer_),
-                                                   1);
-        if(out_bytes <= 0) {
-            throw std::runtime_error("LZ4 error");
-        }
+        size_t out_bytes = HUF_compress(buffer_, sizeof(buffer_), frame.block, BLOCK_SIZE);
         size_t size;
         aku_Status status;
         std::tie(status, size) = _write_frame(file_,
@@ -184,12 +174,8 @@ struct LZ4Volume {
             return std::make_tuple(status, 0);
         }
         assert(frame_size <= sizeof(buffer_));
-        int out_bytes = LZ4_decompress_safe_continue(&decode_stream_,
-                                                     buffer_,
-                                                     frame.block,
-                                                     frame_size,
-                                                     BLOCK_SIZE);
-        if(out_bytes <= 0) {
+        size_t out_bytes = HUF_decompress(frame.block, BLOCK_SIZE, buffer_, frame_size);
+        if(out_bytes != BLOCK_SIZE) {
             return std::make_tuple(AKU_EIO, 0);  // TODO: use different code
         }
         return std::make_tuple(AKU_SUCCESS, frame_size + sizeof(uint32_t));
@@ -213,7 +199,6 @@ public:
     {
         clear(0);
         clear(1);
-        LZ4_resetStream(&stream_);
     }
 
     /**
@@ -233,7 +218,6 @@ public:
     {
         clear(0);
         clear(1);
-        LZ4_setStreamDecode(&decode_stream_, NULL, 0);
     }
 
     size_t file_size() const {
